@@ -119,3 +119,237 @@
 ### 그래서 전혀 다른 프로세스 생성할때는?
 - `fork and exec`  방식을 자주 사용
 </details>
+
+
+<details>
+<summary>4장 프로세스 스케줄러 </summary>
+
+### 프로세스 스케줄러
+- 여러 개의 프로세스를 동시에 동작시키는 것처럼 보이게 함
+- 리눅스에서 멀티코어 CPU 1개는 1개의 CPU로 인식됨
+  - 책에서는 코어 단위를 논리 CPU로 가정
+  - 만약 하이퍼스레드 기능이 있으면,
+    코어내 각각의 하이퍼스레드가 논리 CPU로 인식 됨
+
+### 테스트 프로그램을 작성해보자
+
+```C
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <err.h>
+ 
+#define NLOOP_FOR_ESTIMATION 1000000000UL
+#define NSECS_PER_MSEC 1000000UL
+#define NSECS_PER_SEC 1000000000UL
+
+static unsigned long nloop_per_resol;
+static struct timespec start;
+
+static inline long diff_nsec(struct timespec before, struct timespec after)
+{
+        return ((after.tv_sec * NSECS_PER_SEC + after.tv_nsec)
+                - (before.tv_sec * NSECS_PER_SEC + before.tv_nsec));
+	
+}
+
+static unsigned long estimate_loops_per_msec()
+{
+        struct timespec before, after;
+        clock_gettime(CLOCK_MONOTONIC, &before);
+
+        unsigned long i;
+        for (i = 0; i < NLOOP_FOR_ESTIMATION; i++)
+		;
+
+        clock_gettime(CLOCK_MONOTONIC, &after);
+
+	int ret;
+        return  NLOOP_FOR_ESTIMATION * NSECS_PER_MSEC / diff_nsec(before, after);
+}
+ 
+static inline void load(void)
+{
+        unsigned long i;
+        for (i = 0; i < nloop_per_resol; i++)
+                ;
+}
+
+static void child_fn(int id, struct timespec *buf, int nrecord)
+{
+        int i;
+        for (i = 0; i < nrecord; i++) {
+                struct timespec ts;
+
+                load();
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                buf[i] = ts;
+        }
+        for (i = 0; i < nrecord; i++) {
+                printf("%d\t%ld\t%d\n", id, diff_nsec(start, buf[i]) / NSECS_PER_MSEC, (i + 1) * 100 / nrecord);
+        }
+        exit(EXIT_SUCCESS);
+}
+ 
+static pid_t *pids;
+
+int main(int argc, char *argv[])
+{
+        int ret = EXIT_FAILURE;
+
+        if (argc < 4) {
+                fprintf(stderr, "usage: %s <nproc> <total[ms]> <resolution[ms]>\n", argv[0]);
+                exit(EXIT_FAILURE);
+        }
+
+        int nproc = atoi(argv[1]);
+        int total = atoi(argv[2]);
+        int resol = atoi(argv[3]);
+
+        if (nproc < 1) {
+                fprintf(stderr, "<nproc>(%d) should be >= 1\n", nproc);
+                exit(EXIT_FAILURE);
+        }
+
+        if (total < 1) {
+                fprintf(stderr, "<total>(%d) should be >= 1\n", total);
+                exit(EXIT_FAILURE);
+        }
+
+        if (resol < 1) {
+                fprintf(stderr, "<resol>(%d) should be >= 1\n", resol);
+                exit(EXIT_FAILURE);
+        }
+
+        if (total % resol) {
+                fprintf(stderr, "<total>(%d) should be multiple of <resolution>(%d)\n", total, resol);
+                exit(EXIT_FAILURE);
+        }
+        int nrecord = total / resol;
+
+        struct timespec *logbuf = malloc(nrecord * sizeof(struct timespec));
+	if (!logbuf)
+		err(EXIT_FAILURE, "failed to allocate log buffer");
+
+	puts("estimating the workload which takes just one milli-second...");
+        nloop_per_resol = estimate_loops_per_msec() * resol;
+	puts("end estimation");
+	fflush(stdout);
+
+        pids = malloc(nproc * sizeof(pid_t));
+        if (pids == NULL)
+                err(EXIT_FAILURE, "failed to allocate pid table");
+
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+	ret = EXIT_SUCCESS;
+        int i, ncreated;
+        for (i = 0, ncreated = 0; i < nproc; i++, ncreated++) {
+                pids[i] = fork();
+                if (pids[i] < 0) {
+			int j;
+                	for (j = 0; j < ncreated; j++)
+                        	kill(pids[j], SIGKILL);
+			ret = EXIT_FAILURE;
+                        break;
+                } else if (pids[i] == 0) {
+                        // children
+                        child_fn(i, logbuf, nrecord);
+                        /* shouldn't reach here */
+			abort();
+                }
+        }
+        // parent
+        for (i = 0; i < ncreated; i++)
+                if (wait(NULL) < 0)
+                        warn("wait() failed.");
+
+        exit(ret);
+}
+
+```
+- 결과값의 정확도를 높이기 위해서, OS에서 제공하는 `taskset` 을 활용해 논리 CPU를 지정하자!
+  `taskset -c 0 명령어`
+
+### 컨텍스트 스위치
+- 논리 CPU상에서 동작하는 프로세스가 바뀌는 것을 칭한다
+- 어떤 처리시간이 생각보다 오래 걸렸을때,
+    - 처리 중에 컨텍스트 스위치가 발생해서 다른 프로세스가 움직였을 가능성도 있다는 관점을 가질 수 있다!
+
+### 프로세스의 상태
+- `ps ax` 명령어로 시스템에 존재하는 프로세스 확인 가능
+- `wc -l` 로 출력 결과의 행 수를 셀 수 있음
+- 프로세스의 상태는 다음과 같은 종류를 가짐
+  - 실행 상태
+  - 실행 대기 상태
+  - 슬립 상태
+  - 좀비 상태
+- 앞서 설명한 `ps ax` 를 통해 프로세스의 상태 확인 가능
+  - 3번째 필드 값이 `R`, `S or D`, `Z` 에 따라 판림
+- 슬립상태에서 기다리고 있는 이벤트의 예
+  - 정해진 시간이 경과하는 것을 기다림
+  - 사용자 입력을 기다림
+  - 저장장치의 읽고 쓰기의 종료를 기다림
+  - 네트워크의 데이터 송수신 종료를 기다림
+
+### 상태 변환
+![image](https://user-images.githubusercontent.com/91416897/173188001-f4b3905f-891d-4510-bdc1-298611e64ce0.png)
+- 프로세스가 살아있는 동안 위의 상태를 많이 오고 가면 진행
+
+### idle 상태
+- 논리 CPU에서 아무 프로세스도 동작하지 않는 경우가 있음
+  - 사실 이 경우에는 특수한 프로세스가 동작중임
+  - 실제 구현은 논리 CPU 휴식 상태로 하거나 혹은 소비 전력을 낮춰 대기상태로 구현
+- `sar` 명령어를 통해 단위 시간당 CPU가 얼마나 idle로 있는지 확인 가능
+  - 가장 오른쪽 필드가 1초간 어느정도 idle 상태였는지 보여줌
+
+### 스루풋과 레이턴시
+- 스루풋
+  - 단위 시간당 처리된 일의 양으로 높을수록 좋다
+  - CPU의 idle 상태가 적어질수록 높아진다
+- 레이턴시
+  - 각각의 처리가 시작부터 종료까지의 경과된 시간으로 짧을수록 좋다
+
+### 실제 시스템
+- 스루풋과 레이턴시는 서로 상관관계에 있는 경우가 많다
+
+### 논리 CPU가 여러 개 일때의 스케줄링
+- 로드 밸런서 혹은 글로벌 스케줄러
+  - 여러 개의 논리 CPU에 프로세스를 공평하게 분배해주는 역할을 함
+  - 논리 CPU 개수 확인하기
+    - `grep -c processor /proc/cpuinfo`
+- 이 책에서는 CPU 0, 4를 활용
+  - 이는 두 CPU가 독립성이 높기에 활용
+- 하이퍼스레드가 켜진 상황에서는 결과가 달리 도출될 수 있음
+- 실험 결과 고찰
+  - 1개의 CPU에서는 1개의 프로세스가 처리됨
+  - 여러 프로세스가 실행 가능한 경우, 적절한 길이의 시간마다 CPU에 순차적으로 처리함
+
+### 경과시간과 사용시간
+- `time` 명령어를 통해 프로세스의 시작부터 종료까지의 시간 사이에 `경과시간, 사용시간`이라는 두 수치를 얻을 수 있음
+  - 사용시간은 프로세스가 실제 논리 CPU를 활용한 시간
+![image](https://user-images.githubusercontent.com/91416897/173189756-e9f055ca-cda7-4953-94e7-e8f81c394bf2.png)
+- 위의 경우는 cpu=1, 프로세스수=1 로 해서 사용자 모드에서 CPU를 사용한 시간이 거의 모든 시간을 차지한다.
+  - `user` = 사용자 모드에서 CPU를 사용한 시간
+  - `sys` = 커널이 시스템 콜을 실행한 시간
+
+### 실제 프로세스
+- `ps -eo` 명령어의 `etime, time` 필드는 경과시간과 사용시간을 표현해준다.
+![image](https://user-images.githubusercontent.com/91416897/173189961-f8f02041-94d9-4a44-9986-e7d9d2495b1a.png)
+- `ELAPSED`는 경과시간을, `TIME` 은 CPU사용시간이다.
+
+### 우선 순위 변경
+- 지금까지는 모든 프로세스가 공평하게 CPU 시간을 할당받았지만, 우선순위를 특정 프로세스에게 부여할 수 있다.
+- `nice()` 시스템 콜을 활용한다.
+  - -19 ~ 20 까지의 범위
+  - 값이 낮을수록 우선순위가 높음
+  - 기본값은 0
+- 내리는 것은 누구나 가능, 하지만 높이는 것은 슈퍼유저만 가능
+- C코드 내부에서 변경가능하고, 다음과 같이 변경도 가능
+  `nice -n 5 python3 ./loop.py &`
+  
+</details>
